@@ -2,7 +2,10 @@
 
 /**
  * Post-install script for @iworldafric/timelog
- * Automatically checks and applies required Prisma migrations
+ * - Detects consuming project root using INIT_CWD
+ * - Ensures Prisma models are present (appends idempotently)
+ * - Generates a migration (create-only) and applies via migrate deploy
+ * - Never resets databases; skips on errors without failing install
  */
 
 const fs = require('fs');
@@ -10,214 +13,260 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const MIGRATION_NAME = 'add_timelog_models';
-const MIGRATION_SQL = `
--- CreateEnum
-CREATE TYPE "TimeEntryStatus" AS ENUM ('DRAFT', 'SUBMITTED', 'APPROVED', 'REJECTED', 'LOCKED', 'BILLED');
 
--- CreateEnum
-CREATE TYPE "RoundingInterval" AS ENUM ('NONE', 'ONE_MINUTE', 'FIVE_MINUTES', 'SIX_MINUTES', 'FIFTEEN_MINUTES');
+// Prisma models to append to consumer schema (provider-agnostic)
+const PRISMA_MODELS_BLOCK = `
+// ============================================
+// BEGIN: @iworldafric/timelog models
+// ============================================
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "TimeEntry" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "projectId" TEXT NOT NULL,
-    "developerId" TEXT NOT NULL,
-    "clientId" TEXT NOT NULL,
-    "taskId" TEXT,
-    "startAt" TIMESTAMP(3) NOT NULL,
-    "endAt" TIMESTAMP(3) NOT NULL,
-    "durationMinutes" INTEGER NOT NULL,
-    "billable" BOOLEAN NOT NULL DEFAULT true,
-    "status" "TimeEntryStatus" NOT NULL DEFAULT 'DRAFT',
-    "category" TEXT NOT NULL,
-    "notes" TEXT,
-    "tags" TEXT[],
-    "approvedBy" TEXT,
-    "approvedAt" TIMESTAMP(3),
-    "rejectedBy" TEXT,
-    "rejectedAt" TIMESTAMP(3),
-    "rejectionReason" TEXT,
-    "lockedAt" TIMESTAMP(3),
-    "billedAt" TIMESTAMP(3),
-    "invoiceId" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-    CONSTRAINT "TimeEntry_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT "TimeEntry_developerId_fkey" FOREIGN KEY ("developerId") REFERENCES "DeveloperProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT "TimeEntry_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "ClientProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+enum TimeEntryStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  LOCKED
+  BILLED
+}
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "Timesheet" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "developerId" TEXT NOT NULL,
-    "periodStart" TIMESTAMP(3) NOT NULL,
-    "periodEnd" TIMESTAMP(3) NOT NULL,
-    "status" "TimeEntryStatus" NOT NULL DEFAULT 'DRAFT',
-    "totalMinutes" INTEGER NOT NULL DEFAULT 0,
-    "billableMinutes" INTEGER NOT NULL DEFAULT 0,
-    "nonBillableMinutes" INTEGER NOT NULL DEFAULT 0,
-    "submittedAt" TIMESTAMP(3),
-    "approvedAt" TIMESTAMP(3),
-    "approvedBy" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-    CONSTRAINT "Timesheet_developerId_fkey" FOREIGN KEY ("developerId") REFERENCES "DeveloperProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+model TimeCategory {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  billable    Boolean     @default(true)
+  description String?
+  isActive    Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "RateCard" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "developerId" TEXT,
-    "projectId" TEXT,
-    "clientId" TEXT,
-    "hourlyRate" DOUBLE PRECISION NOT NULL,
-    "currency" TEXT NOT NULL DEFAULT 'USD',
-    "effectiveFrom" TIMESTAMP(3) NOT NULL,
-    "effectiveTo" TIMESTAMP(3),
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-    CONSTRAINT "RateCard_developerId_fkey" FOREIGN KEY ("developerId") REFERENCES "DeveloperProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT "RateCard_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT "RateCard_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "ClientProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+  timeEntries TimeEntry[]
+}
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "TimeCategory" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "name" TEXT NOT NULL,
-    "description" TEXT,
-    "billableByDefault" BOOLEAN NOT NULL DEFAULT true,
-    "color" TEXT,
-    "icon" TEXT,
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL
-);
+model RateCard {
+  id            String    @id @default(cuid())
+  developerId   String
+  projectId     String?
+  clientId      String?
+  currency      String    @default("USD")
+  rate          Float
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "TimeLock" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "projectId" TEXT,
-    "clientId" TEXT,
-    "periodStart" TIMESTAMP(3) NOT NULL,
-    "periodEnd" TIMESTAMP(3) NOT NULL,
-    "reason" TEXT NOT NULL,
-    "lockedBy" TEXT NOT NULL,
-    "lockedAt" TIMESTAMP(3) NOT NULL,
-    "unlockedBy" TEXT,
-    "unlockedAt" TIMESTAMP(3),
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-    CONSTRAINT "TimeLock_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT "TimeLock_clientId_fkey" FOREIGN KEY ("clientId") REFERENCES "ClientProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+  developer     DeveloperProfile @relation(fields: [developerId], references: [id], onDelete: Cascade)
+  project       Project?         @relation(fields: [projectId], references: [id])
+  client        ClientProfile?   @relation(fields: [clientId], references: [id])
 
--- CreateTable
-CREATE TABLE IF NOT EXISTS "AuditLog" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "entityType" TEXT NOT NULL,
-    "entityId" TEXT NOT NULL,
-    "action" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "metadata" JSONB,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+  @@index([developerId, projectId, clientId, effectiveFrom])
+}
 
--- CreateIndex
-CREATE INDEX IF NOT EXISTS "TimeEntry_projectId_idx" ON "TimeEntry"("projectId");
-CREATE INDEX IF NOT EXISTS "TimeEntry_developerId_idx" ON "TimeEntry"("developerId");
-CREATE INDEX IF NOT EXISTS "TimeEntry_clientId_idx" ON "TimeEntry"("clientId");
-CREATE INDEX IF NOT EXISTS "TimeEntry_status_idx" ON "TimeEntry"("status");
-CREATE INDEX IF NOT EXISTS "TimeEntry_startAt_idx" ON "TimeEntry"("startAt");
-CREATE INDEX IF NOT EXISTS "TimeEntry_billable_idx" ON "TimeEntry"("billable");
+model TimeEntry {
+  id              String          @id @default(cuid())
+  projectId       String
+  taskId          String?
+  developerId     String
+  categoryId      String?
+  startAt         DateTime
+  endAt           DateTime
+  durationMinutes Int
+  roundedMinutes  Int             @default(0)
+  roundingRule    String?
+  billable        Boolean         @default(true)
+  tags            String?
+  notes           String?
+  status          TimeEntryStatus @default(DRAFT)
+  submittedAt     DateTime?
+  approvedAt      DateTime?
+  approverUserId  String?
+  rejectedAt      DateTime?
+  rejectorUserId  String?
+  rejectionReason String?
+  lockedAt        DateTime?
+  lockReason      String?
+  billedInvoiceId String?
+  createdByUserId String
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
 
--- CreateIndex
-CREATE INDEX IF NOT EXISTS "Timesheet_developerId_idx" ON "Timesheet"("developerId");
-CREATE INDEX IF NOT EXISTS "Timesheet_periodStart_idx" ON "Timesheet"("periodStart");
-CREATE INDEX IF NOT EXISTS "Timesheet_status_idx" ON "Timesheet"("status");
+  project         Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task            Task?            @relation(fields: [taskId], references: [id])
+  developer       DeveloperProfile @relation(fields: [developerId], references: [id], onDelete: Cascade)
+  category        TimeCategory?    @relation(fields: [categoryId], references: [id])
 
--- CreateIndex
-CREATE INDEX IF NOT EXISTS "RateCard_developerId_idx" ON "RateCard"("developerId");
-CREATE INDEX IF NOT EXISTS "RateCard_projectId_idx" ON "RateCard"("projectId");
-CREATE INDEX IF NOT EXISTS "RateCard_clientId_idx" ON "RateCard"("clientId");
-CREATE INDEX IF NOT EXISTS "RateCard_effectiveFrom_idx" ON "RateCard"("effectiveFrom");
+  @@index([projectId, developerId, startAt, status])
+  @@index([developerId, startAt])
+  @@index([projectId, status])
+}
 
--- CreateIndex
-CREATE INDEX IF NOT EXISTS "TimeLock_projectId_idx" ON "TimeLock"("projectId");
-CREATE INDEX IF NOT EXISTS "TimeLock_clientId_idx" ON "TimeLock"("clientId");
-CREATE INDEX IF NOT EXISTS "TimeLock_periodStart_idx" ON "TimeLock"("periodStart");
-CREATE INDEX IF NOT EXISTS "TimeLock_isActive_idx" ON "TimeLock"("isActive");
+model Timesheet {
+  id                 String          @id @default(cuid())
+  developerId        String
+  weekStart          DateTime
+  weekEnd            DateTime
+  status             String          @default("OPEN")
+  submittedAt        DateTime?
+  approvedAt         DateTime?
+  approverUserId     String?
+  totalMinutes       Int             @default(0)
+  billableMinutes    Int             @default(0)
+  nonBillableMinutes Int             @default(0)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
 
--- CreateIndex
-CREATE INDEX IF NOT EXISTS "AuditLog_entityType_entityId_idx" ON "AuditLog"("entityType", "entityId");
-CREATE INDEX IF NOT EXISTS "AuditLog_userId_idx" ON "AuditLog"("userId");
-CREATE INDEX IF NOT EXISTS "AuditLog_createdAt_idx" ON "AuditLog"("createdAt");
+  developer          DeveloperProfile @relation(fields: [developerId], references: [id], onDelete: Cascade)
+
+  @@unique([developerId, weekStart])
+  @@index([weekStart, status])
+  @@index([developerId, status])
+}
+
+model TimeLock {
+  id         String   @id @default(cuid())
+  projectId  String?
+  clientId   String?
+  from       DateTime
+  to         DateTime
+  reason     String?
+  lockedBy   String
+  unlockedBy String?
+  unlockedAt DateTime?
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project    Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  client     ClientProfile? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, from, to])
+  @@index([clientId, from, to])
+  @@index([isActive])
+}
+
+model TimelogAuditLog {
+  id          String   @id @default(cuid())
+  entityType  String
+  entityId    String
+  action      String
+  userId      String
+  userRole    String?
+  changes     String?
+  metadata    String?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ============================================
+// END: @iworldafric/timelog models
+// ============================================
 `;
+
+function findUp(startDir, relativePath) {
+  let current = startDir;
+  const { root } = path.parse(startDir);
+  while (true) {
+    const candidate = path.join(current, relativePath);
+    if (fs.existsSync(candidate)) return { rootDir: current, fullPath: candidate };
+    if (current === root) break;
+    current = path.dirname(current);
+  }
+  return null;
+}
+
+function resolveProjectRoot() {
+  const candidates = [
+    process.env.INIT_CWD,
+    process.env.npm_config_local_prefix,
+    path.resolve(process.cwd(), '../../..'),
+    path.resolve(__dirname, '../../../..'),
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    const found = findUp(c, 'prisma/schema.prisma');
+    if (found) return found.rootDir;
+  }
+
+  // Fallback: walk up from current working dir
+  const fallback = findUp(process.cwd(), 'prisma/schema.prisma');
+  return fallback ? fallback.rootDir : null;
+}
+
+function ensureTimelogModels(appPrismaSchemaPath) {
+  const schema = fs.readFileSync(appPrismaSchemaPath, 'utf8');
+  const hasMarker = schema.includes('BEGIN: @iworldafric/timelog models');
+  const hasTimeEntry = /\bmodel\s+TimeEntry\b/.test(schema);
+  if (hasMarker || hasTimeEntry) {
+    console.log('ℹ️  Timelog models already present in schema.prisma.');
+    return false;
+  }
+
+  const updated = schema.trimEnd() + '\n\n' + PRISMA_MODELS_BLOCK + '\n';
+  fs.writeFileSync(appPrismaSchemaPath, updated, 'utf8');
+  console.log('✅ Appended Timelog models to prisma/schema.prisma');
+  return true;
+}
 
 async function runMigration() {
   console.log('🚀 @iworldafric/timelog: Checking database migrations...\n');
 
   try {
-    // Check if we're in a project with Prisma
-    const prismaSchemaPath = path.resolve(process.cwd(), 'prisma', 'schema.prisma');
-    
+    const projectRoot = resolveProjectRoot();
+    if (!projectRoot) {
+      console.log('⚠️  Could not locate project root with prisma/schema.prisma. Skipping.');
+      console.log('   You can run manually: node node_modules/@iworldafric/timelog/scripts/postinstall.cjs\n');
+      return;
+    }
+
+    const prismaSchemaPath = path.join(projectRoot, 'prisma', 'schema.prisma');
+    const migrationsDir = path.join(projectRoot, 'prisma', 'migrations');
+
+    console.log(`📁 Using project root: ${projectRoot}`);
     if (!fs.existsSync(prismaSchemaPath)) {
       console.log('⚠️  No Prisma schema found. Skipping migration.');
       console.log('   Please ensure you have Prisma configured in your project.\n');
       console.log('📖 See documentation: https://github.com/Mrrobotke/iworldafric-timelog\n');
       return;
     }
-
     console.log('✅ Prisma schema found');
-    
+
+    // Ensure models are present (idempotent)
+    const appended = ensureTimelogModels(prismaSchemaPath);
+
     // Check if migration already exists
-    const migrationsDir = path.resolve(process.cwd(), 'prisma', 'migrations');
-    
+    let timelogMigrationExists = false;
     if (fs.existsSync(migrationsDir)) {
       const migrations = fs.readdirSync(migrationsDir);
-      const timelogMigration = migrations.find(m => m.includes('timelog'));
-      
-      if (timelogMigration) {
-        console.log('✅ Timelog migration already exists. Skipping.\n');
-        return;
-      }
+      timelogMigrationExists = migrations.some((m) => m.includes(MIGRATION_NAME) || m.includes('timelog'));
     }
 
-    console.log('📝 Creating timelog migration...');
-    
-    // Create migration using Prisma CLI
-    try {
-      execSync(`npx prisma migrate dev --name ${MIGRATION_NAME} --create-only`, {
-        stdio: 'pipe'
-      });
-      
-      // Find the newly created migration
-      const migrations = fs.readdirSync(migrationsDir);
-      const newMigration = migrations.find(m => m.includes(MIGRATION_NAME));
-      
-      if (newMigration) {
-        const migrationSqlPath = path.join(migrationsDir, newMigration, 'migration.sql');
-        
-        // Write our SQL to the migration file
-        fs.writeFileSync(migrationSqlPath, MIGRATION_SQL);
-        
+    // Generate migration (create-only) if needed
+    if (appended || !timelogMigrationExists) {
+      console.log('📝 Creating timelog migration...');
+      try {
+        execSync(`npx --yes prisma migrate dev --name ${MIGRATION_NAME} --create-only`, {
+          cwd: projectRoot,
+          stdio: 'pipe',
+        });
         console.log('✅ Migration created successfully');
-        console.log('\n🔄 Applying migration...');
-        
-        // Apply the migration
-        execSync('npx prisma migrate dev', { stdio: 'inherit' });
-        
-        console.log('\n✅ @iworldafric/timelog database setup complete!');
+      } catch (err) {
+        console.log('⚠️  Could not create migration automatically:', err.message);
       }
-    } catch (error) {
-      console.log('\n⚠️  Could not create migration automatically.');
-      console.log('   Please add the timelog models to your Prisma schema manually.');
-      console.log('   See: https://github.com/Mrrobotke/iworldafric-timelog#manual-setup\n');
+    } else {
+      console.log('ℹ️  Timelog migration already exists.');
     }
-    
+
+    // Apply migrations non-interactively (no reset). If this fails, instruct manual run.
+    try {
+      console.log('\n🔄 Applying migrations (deploy)...');
+      execSync('npx --yes prisma migrate deploy', { cwd: projectRoot, stdio: 'inherit' });
+      console.log('\n✅ @iworldafric/timelog database setup complete!');
+    } catch (err) {
+      console.log('\n⚠️  Could not apply migrations automatically.');
+      console.log('   Please run: npx prisma migrate dev');
+    }
   } catch (error) {
     console.error('❌ Migration setup failed:', error.message);
     console.log('\n📖 For manual setup instructions, visit:');
@@ -233,5 +282,3 @@ if (require.main === module) {
 }
 
 module.exports = { runMigration };
-
-
