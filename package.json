@@ -58,7 +58,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
     "clean": "rm -rf dist coverage .turbo",
-    "postinstall": "node scripts/postinstall.js",
+    "postinstall": "node scripts/postinstall.cjs",
     "prepublishOnly": "npm run build && npm run test"
   },
   "dependencies": {
@@ -69,7 +69,7 @@
   },
   "peerDependencies": {
     "@chakra-ui/react": "^2.0.0",
-    "@prisma/client": "^5.0.0",
+    "@prisma/client": "^6.14.0",
     "@tanstack/react-query": "^5.0.0",
     "next": "^15.4.4",
     "next-auth": "^4.0.0",
