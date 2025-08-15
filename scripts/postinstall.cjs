@@ -209,6 +209,65 @@ function ensureTimelogModels(appPrismaSchemaPath) {
   return true;
 }
 
+function injectBackRelations(appPrismaSchemaPath) {
+  let schema = fs.readFileSync(appPrismaSchemaPath, 'utf8');
+
+  function injectFieldIntoModel(text, modelName, fieldLine) {
+    const modelHeader = `model ${modelName}`;
+    const startIdx = text.indexOf(modelHeader);
+    if (startIdx === -1) {
+      return text; // model not found, skip
+    }
+    // Find opening brace
+    const openIdx = text.indexOf('{', startIdx);
+    if (openIdx === -1) {
+      return text;
+    }
+    // Find closing brace for this model (naive scan)
+    let i = openIdx + 1;
+    let depth = 1;
+    while (i < text.length && depth > 0) {
+      const ch = text[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+      i++;
+    }
+    const closeIdx = i - 1;
+    if (closeIdx <= openIdx) {
+      return text;
+    }
+    const modelBody = text.slice(openIdx + 1, closeIdx);
+    // If field already exists, do nothing
+    if (new RegExp(`\\b${fieldLine.split(/\s+/)[0]}\\b`).test(modelBody)) {
+      return text;
+    }
+    // Insert before closing brace with two-space indent
+    const insertion = `\n  ${fieldLine}\n`;
+    const newText = text.slice(0, closeIdx) + insertion + text.slice(closeIdx);
+    return newText;
+  }
+
+  // DeveloperProfile relations
+  schema = injectFieldIntoModel(schema, 'DeveloperProfile', 'timeEntries  TimeEntry[]');
+  schema = injectFieldIntoModel(schema, 'DeveloperProfile', 'timesheets   Timesheet[]');
+  schema = injectFieldIntoModel(schema, 'DeveloperProfile', 'rateCards    RateCard[]');
+
+  // ClientProfile relations
+  schema = injectFieldIntoModel(schema, 'ClientProfile', 'rateCards    RateCard[]');
+  schema = injectFieldIntoModel(schema, 'ClientProfile', 'timeLocks    TimeLock[]');
+
+  // Project relations
+  schema = injectFieldIntoModel(schema, 'Project', 'timeEntries  TimeEntry[]');
+  schema = injectFieldIntoModel(schema, 'Project', 'rateCards    RateCard[]');
+  schema = injectFieldIntoModel(schema, 'Project', 'timeLocks    TimeLock[]');
+
+  // Task relations
+  schema = injectFieldIntoModel(schema, 'Task', 'timeEntries  TimeEntry[]');
+
+  fs.writeFileSync(appPrismaSchemaPath, schema, 'utf8');
+  console.log('✅ Ensured back-relations on existing models');
+}
+
 async function runMigration() {
   console.log('🚀 @iworldafric/timelog: Checking database migrations...\n');
 
@@ -234,6 +293,13 @@ async function runMigration() {
 
     // Ensure models are present (idempotent)
     const appended = ensureTimelogModels(prismaSchemaPath);
+
+    // Ensure back-relations exist on host models
+    try {
+      injectBackRelations(prismaSchemaPath);
+    } catch (e) {
+      console.log('⚠️  Could not ensure back-relations automatically:', e.message);
+    }
 
     // Check if migration already exists
     let timelogMigrationExists = false;
